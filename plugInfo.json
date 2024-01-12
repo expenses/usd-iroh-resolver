@@ -1,0 +1,21 @@
+{
+    "Plugins": [
+        {
+            "Info": {
+                "Types": {
+                    "IrohResolver": {
+                        "bases": [
+                            "ArResolver"
+                        ],
+                        "uriSchemes": ["iroh"]
+                    }
+                }
+            },
+            "LibraryPath": "target/release/libusd_iroh_resolver.so",
+            "Name": "IrohResolver",
+            "ResourcePath": "resources",
+            "Root": ".",
+            "Type": "library"
+        }
+    ]
+}

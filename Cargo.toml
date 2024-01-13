@@ -12,7 +12,6 @@ bbl-usd = { version = "0.1.0", path = "../bbl-usd-rs" }
 bytes = "1.5.0"
 ctor = "0.2.6"
 futures-util = "0.3.30"
-iroh = "0.12.0"
+iroh = { path = "../iroh/iroh"}
 lazy_static = "1.4.0"
 tokio = "1.35.1"
-url = "2.5.0"

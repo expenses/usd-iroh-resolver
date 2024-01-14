@@ -2,8 +2,8 @@ use bbl_usd::{ar, cpp, ffi, tf};
 use ctor::ctor;
 use itertools::Itertools;
 use lazy_static::lazy_static;
-use std::str::FromStr;
 use std::ffi::c_void;
+use std::str::FromStr;
 
 use iroh::{
     client::quic::{Doc, Iroh},
@@ -254,23 +254,25 @@ extern "C" fn get_modification_timestamp(
 
 struct WritableAsset {
     path: String,
-    bytes: Vec<u8>
+    bytes: Vec<u8>,
 }
 
-extern "C" fn open_writable_asset(path: *const ffi::ar_ResolvedPath_t, mode: ffi::ar_ResolvedWriteMode) -> *mut c_void {
+extern "C" fn open_writable_asset(
+    path: *const ffi::ar_ResolvedPath_t,
+    mode: ffi::ar_ResolvedWriteMode,
+) -> *mut c_void {
     assert_eq!(mode, ffi::ar_ResolvedWriteMode_ar_ResolvedWriteMode_Replace);
     Box::into_raw(Box::new(WritableAsset {
-        path: ar::ResolvedPathRef::from_raw(path).get_path_string().as_str().to_owned(),
-        bytes: Vec::new()
+        path: ar::ResolvedPathRef::from_raw(path)
+            .get_path_string()
+            .as_str()
+            .to_owned(),
+        bytes: Vec::new(),
     })) as _
 }
 
-extern "C" fn close_writable_asset(
-    context: *mut c_void
-) -> bool {
-    let asset = unsafe {
-        &*(context as *mut WritableAsset)
-    };
+extern "C" fn close_writable_asset(context: *mut c_void) -> bool {
+    let asset = unsafe { Box::from_raw(context as *mut WritableAsset) };
 
     let try_fn = |iroh| async move {
         let author_id = std::env::var("IROH_AUTHOR_ID")?;
@@ -280,7 +282,7 @@ extern "C" fn close_writable_asset(
             Ok(HashOrTicket::Doc(_, namespace_or_ticket, key)) => {
                 let doc = namespace_or_ticket.get_doc(iroh).await?;
                 let key = string_key_to_bytes_key(&key);
-                doc.set_bytes(author_id, bytes::Bytes::copy_from_slice(&key), &*asset.bytes)
+                doc.set_bytes(author_id, bytes::Bytes::copy_from_slice(&key), asset.bytes)
                     .await?;
                 Ok(())
             }
@@ -289,27 +291,28 @@ extern "C" fn close_writable_asset(
     };
 
     if let Err(err) = RUNTIME.block_on(try_fn(&IROH)) {
-        dbg!(err);
+        println!("{}", err);
         false
     } else {
         true
     }
 }
 
-extern "C" fn write_writable_asset(context: *mut c_void, src: *const c_void, count: usize, offset: usize) -> usize {
-    let asset = unsafe {
-        &mut *(context as *mut WritableAsset)
-    };
+extern "C" fn write_writable_asset(
+    context: *mut c_void,
+    src: *const c_void,
+    count: usize,
+    offset: usize,
+) -> usize {
+    let asset = unsafe { &mut *(context as *mut WritableAsset) };
 
-    let src = unsafe {
-        std::slice::from_raw_parts(src as *const u8, count)
-    };
+    let src = unsafe { std::slice::from_raw_parts(src as *const u8, count) };
 
     if count + offset > asset.bytes.len() {
         asset.bytes.resize(count + offset, 0);
     }
 
-    asset.bytes[offset..offset+count].copy_from_slice(src);
+    asset.bytes[offset..offset + count].copy_from_slice(src);
 
     count
 }
@@ -327,6 +330,6 @@ fn ctor() {
         Some(get_modification_timestamp),
         close_writable_asset,
         open_writable_asset,
-        write_writable_asset
+        write_writable_asset,
     );
 }

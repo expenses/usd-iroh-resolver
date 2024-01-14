@@ -3,6 +3,7 @@ use ctor::ctor;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use std::str::FromStr;
+use std::ffi::c_void;
 
 use iroh::{
     client::quic::{Doc, Iroh},
@@ -218,9 +219,7 @@ extern "C" fn get_modification_timestamp(
 ) {
     let path = cpp::StringRef::from_ptr(path);
 
-    let iroh = &IROH;
-
-    let result = RUNTIME.block_on(async {
+    let try_get_modifcation_timestamp = |iroh| async move {
         match HashOrTicket::parse(path.as_str()) {
             // If the path doesn't point to a document, just set the timestamp to 0.
             Ok(HashOrTicket::Hash(..) | HashOrTicket::Ticket(..)) | Err(_) => {
@@ -240,11 +239,73 @@ extern "C" fn get_modification_timestamp(
         };
 
         Ok::<_, anyhow::Error>(())
-    });
+    };
 
-    if let Err(error) = result {
+    if let Err(error) = RUNTIME.block_on(try_get_modifcation_timestamp(&IROH)) {
         println!("{}", error);
     }
+}
+
+struct WritableAsset {
+    path: String,
+    bytes: Vec<u8>
+}
+
+extern "C" fn open_writable_asset(path: *const ffi::ar_ResolvedPath_t, mode: ffi::ar_ResolvedWriteMode) -> *mut c_void {
+    assert_eq!(mode, ffi::ar_ResolvedWriteMode_ar_ResolvedWriteMode_Replace);
+    Box::into_raw(Box::new(WritableAsset {
+        path: ar::ResolvedPath::from_raw(path).get_path_string().as_str().to_owned(),
+        bytes: Vec::new()
+    })) as _
+}
+
+extern "C" fn close_writable_asset(
+    context: *mut c_void
+) -> bool {
+    let asset = unsafe {
+        &*(context as *mut WritableAsset)
+    };
+
+    let try_fn = |iroh| async move {
+        let author_id = std::env::var("IROH_AUTHOR_ID")?;
+        let author_id = iroh::sync::AuthorId::from_str(&author_id)?;
+
+        match HashOrTicket::parse(&asset.path) {
+            Ok(HashOrTicket::Doc(_, namespace_or_ticket, key)) => {
+                let doc = namespace_or_ticket.get_doc(iroh).await?;
+                let key = string_key_to_bytes_key(&key);
+                doc.set_bytes(author_id, bytes::Bytes::copy_from_slice(&key), &*asset.bytes)
+                    .await?;
+                Ok(())
+            }
+            other => return Err(anyhow::anyhow!("{:?}", other)),
+        }
+    };
+
+    if let Err(err) = RUNTIME.block_on(try_fn(&IROH)) {
+        dbg!(err);
+        false
+    } else {
+        true
+    }
+}
+
+extern "C" fn write_writable_asset(context: *mut c_void, src: *const c_void, count: usize, offset: usize) -> usize {
+    let asset = unsafe {
+        &mut *(context as *mut WritableAsset)
+    };
+
+    let src = unsafe {
+        std::slice::from_raw_parts(src as *const u8, count)
+    };
+
+    if count + offset > asset.bytes.len() {
+        asset.bytes.resize(count + offset, 0);
+    }
+
+    asset.bytes[offset..offset+count].copy_from_slice(src);
+
+    count
 }
 
 #[ctor]
@@ -252,9 +313,14 @@ fn ctor() {
     let ty = tf::Type::declare("IrohResolver");
     ty.set_factory(
         create_identifier,
+        create_identifier,
         open_asset,
+        resolve,
         resolve,
         None,
         Some(get_modification_timestamp),
+        close_writable_asset,
+        open_writable_asset,
+        write_writable_asset
     );
 }

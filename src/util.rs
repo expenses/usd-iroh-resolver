@@ -26,14 +26,14 @@ pub async fn finish_download(
 }
 
 pub async fn wait_until_available(
-    doc: &Doc,
+    mut events: impl Stream<Item = anyhow::Result<LiveEvent>> + std::marker::Unpin,
     key: &[u8],
     iroh: &Iroh,
     mut looking_for_hash: Option<Hash>,
 ) -> anyhow::Result<bytes::Bytes> {
-    let mut events = doc.subscribe().await?;
-
     while let Some(event) = events.next().await {
+        //dbg!(looking_for_hash.as_ref().map(|h| h.to_string()), &event);
+
         match event? {
             // If a new insert was made with the key then just use that.
             LiveEvent::InsertLocal { entry }
@@ -70,14 +70,15 @@ pub async fn wait_until_available(
 }
 
 pub async fn get_entry_in_doc(doc: &Doc, key: &[u8]) -> anyhow::Result<Entry> {
+    // Create the event stream early so we don't miss items.
+    let mut events = doc.subscribe().await?;
+
     if let Some(entry) = doc
         .get_one(Query::single_latest_per_key().key_exact(key))
         .await?
     {
         Ok(entry)
     } else {
-        let mut events = doc.subscribe().await?;
-
         while let Some(event) = events.next().await {
             match event? {
                 LiveEvent::InsertLocal { entry } | LiveEvent::InsertRemote { entry, .. } => {
@@ -107,20 +108,26 @@ pub async fn print_keys(doc: &Doc) -> anyhow::Result<()> {
 }
 
 pub async fn get_key_in_doc(doc: &Doc, iroh: &Iroh, key: &[u8]) -> anyhow::Result<bytes::Bytes> {
+    // Create the event stream early so we don't miss items.
+    let events = doc.subscribe().await?;
+
     if let Some(entry) = doc
         .get_one(Query::single_latest_per_key().key_exact(key))
         .await?
     {
         // If the content is available then we can just return it immediately
-        if let Ok(bytes) = entry.content_bytes(iroh).await {
-            Ok(bytes)
-        } else {
-            // Otherwise we need to wait until it becomes availble, but at least
-            // we know the hash we're waiting for.
-            wait_until_available(doc, key, iroh, Some(entry.content_hash())).await
+        match entry.content_bytes(iroh).await {
+            Ok(bytes) => Ok(bytes),
+            Err(_error) => {
+                //dbg!(&_error, std::str::from_utf8(key));
+                //dbg!(&entry);
+                // Otherwise we need to wait until it becomes availble, but at least
+                // we know the hash we're waiting for.
+                wait_until_available(events, key, iroh, Some(entry.content_hash())).await
+            }
         }
     } else {
         // We don't know the hash we're waiting for, so just wait for an insert to be made to the key.
-        wait_until_available(doc, key, iroh, None).await
+        wait_until_available(events, key, iroh, None).await
     }
 }

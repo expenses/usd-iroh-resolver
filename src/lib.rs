@@ -145,7 +145,7 @@ extern "C" fn open_asset(
     path: *const ffi::ar_ResolvedPath_t,
     output: *mut *mut ffi::ar_AssetSharedPtr_t,
 ) {
-    let string = ar::ResolvedPath::from_raw(path).get_path_string();
+    let string = ar::ResolvedPathRef::from_raw(path).get_path_string();
     match RUNTIME.block_on(handle_url(string.as_str(), &IROH)) {
         Ok(bytes) => unsafe {
             ffi::ar_asset_from_bytes(bytes.as_ptr() as _, bytes.len(), output);
@@ -158,7 +158,9 @@ extern "C" fn open_asset(
 
 extern "C" fn resolve(string: *const ffi::std_String_t, output: *mut *mut ffi::ar_ResolvedPath_t) {
     let string = cpp::StringRef::from_ptr(string);
-    unsafe { *output = ar::ResolvedPathRef::new(&string).ptr() as _ };
+    let resolved_path = ar::ResolvedPath::new(&string);
+    unsafe { *output = resolved_path.ptr() as _ };
+    std::mem::forget(resolved_path);
 }
 
 extern "C" fn create_identifier(
@@ -166,7 +168,7 @@ extern "C" fn create_identifier(
     anchor: *const ffi::ar_ResolvedPath_t,
     output: *mut *mut ffi::std_String_t,
 ) {
-    let anchor = ar::ResolvedPath::from_raw(anchor).get_path_string();
+    let anchor = ar::ResolvedPathRef::from_raw(anchor).get_path_string();
     let anchor = anchor.as_str();
     let path = cpp::StringRef::from_ptr(path);
 
@@ -223,18 +225,22 @@ extern "C" fn get_modification_timestamp(
         match HashOrTicket::parse(path.as_str()) {
             // If the path doesn't point to a document, just set the timestamp to 0.
             Ok(HashOrTicket::Hash(..) | HashOrTicket::Ticket(..)) | Err(_) => {
+                let ar_timestamp = ar::Timestamp::from_time(0.0);
                 unsafe {
-                    *timestamp = ar::Timestamp::from_time(0.0).ptr() as _;
+                    *timestamp = ar_timestamp.ptr() as _;
                 };
+                std::mem::forget(ar_timestamp);
                 return Ok(());
             }
             // Otherwise try to load a document and get the timestamp of the entry matching the key.
             Ok(HashOrTicket::Doc(_, namespace_or_ticket, key)) => {
                 let doc = namespace_or_ticket.get_doc(iroh).await?;
                 let entry = get_entry_in_doc(&doc, &string_key_to_bytes_key(&key)).await?;
+                let ar_timestamp = ar::Timestamp::from_time(entry.timestamp() as f64);
                 unsafe {
-                    *timestamp = ar::Timestamp::from_time(entry.timestamp() as f64).ptr() as _;
+                    *timestamp = ar_timestamp.ptr() as _;
                 };
+                std::mem::forget(ar_timestamp);
             }
         };
 
@@ -254,7 +260,7 @@ struct WritableAsset {
 extern "C" fn open_writable_asset(path: *const ffi::ar_ResolvedPath_t, mode: ffi::ar_ResolvedWriteMode) -> *mut c_void {
     assert_eq!(mode, ffi::ar_ResolvedWriteMode_ar_ResolvedWriteMode_Replace);
     Box::into_raw(Box::new(WritableAsset {
-        path: ar::ResolvedPath::from_raw(path).get_path_string().as_str().to_owned(),
+        path: ar::ResolvedPathRef::from_raw(path).get_path_string().as_str().to_owned(),
         bytes: Vec::new()
     })) as _
 }

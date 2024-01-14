@@ -1,9 +1,20 @@
 use bbl_usd::{ar, cpp, ffi, tf};
 use ctor::ctor;
-use futures_util::stream::{Stream, StreamExt};
-use iroh::rpc_protocol::DownloadProgress;
+use itertools::Itertools;
 use lazy_static::lazy_static;
 use std::str::FromStr;
+
+use iroh::{
+    client::quic::{Doc, Iroh},
+    net::magic_endpoint::NodeAddr,
+    rpc_protocol::{BlobFormat, Hash},
+    sync::NamespaceId,
+    ticket::{BlobTicket, DocTicket},
+};
+
+mod util;
+
+use util::*;
 
 lazy_static! {
     static ref RUNTIME: tokio::runtime::Runtime =
@@ -13,48 +24,63 @@ lazy_static! {
         .expect("Failed to connect to iroh node");
 }
 
-use iroh::{
-    client::{
-        quic::{Doc, Iroh},
-        Entry, LiveEvent,
-    },
-    net::magic_endpoint::NodeAddr,
-    rpc_protocol::{BlobFormat, Hash},
-    sync::{store::Query, ContentStatus, NamespaceId},
-    ticket::{BlobTicket, DocTicket},
-};
-
-#[derive(Debug)]
-enum HashOrTicket<'a> {
-    Hash(Hash, &'a str),
-    Ticket(NodeAddr, Hash),
-    Doc(NamespaceId, Vec<u8>),
-    DocTicket(DocTicket, Vec<u8>),
+fn string_key_to_bytes_key(string: &str) -> Vec<u8> {
+    let mut bytes = string.as_bytes().to_owned();
+    bytes.push(0);
+    bytes
 }
 
-impl<'a> HashOrTicket<'a> {
-    fn parse(uri: &'a str) -> anyhow::Result<Self> {
-        if !uri.starts_with("iroh://") {
-            return Err(anyhow::anyhow!("request isn't an iroh URI: {}", uri));
+#[derive(Debug)]
+enum NamespaceIdOrDocTicket {
+    NamespaceId(NamespaceId),
+    DocTicket(DocTicket),
+}
+
+impl NamespaceIdOrDocTicket {
+    async fn get_doc(self, iroh: &Iroh) -> anyhow::Result<Doc> {
+        match self {
+            Self::NamespaceId(namespace) => iroh
+                .docs
+                .open(namespace)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Missing document: {}", namespace)),
+            Self::DocTicket(ticket) => iroh.docs.import(ticket).await,
         }
+    }
+}
 
-        let (components, ext) = &uri["iroh://".len()..]
-            .rsplit_once('.')
-            .ok_or_else(|| anyhow::anyhow!("Missing ext: {}", uri))?;
+#[derive(Debug)]
+enum HashOrTicket {
+    Hash(Hash, String),
+    Ticket(NodeAddr, Hash),
+    Doc(url::Url, NamespaceIdOrDocTicket, String),
+}
 
-        let mut components = components.split('/');
+impl HashOrTicket {
+    fn parse(raw_url: &str) -> anyhow::Result<Self> {
+        let uri = url::Url::parse(raw_url)?;
 
-        Ok(match components.next() {
+        let mut components = uri
+            .path_segments()
+            .ok_or_else(|| anyhow::anyhow!("No path in {}", uri))?;
+
+        Ok(match uri.domain() {
             Some("blob") => {
-                let hash = components
+                let hash_and_ext = components
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("Missing hash: {}", uri))?;
-                Self::Hash(iroh::rpc_protocol::Hash::from_str(hash)?, ext)
+                let (hash, ext) = hash_and_ext
+                    .split_once('.')
+                    .ok_or_else(|| anyhow::anyhow!("Missing ext: {}", hash_and_ext))?;
+                Self::Hash(iroh::rpc_protocol::Hash::from_str(hash)?, ext.to_owned())
             }
             Some("ticket") => {
-                let ticket = components
+                let ticket_and_ext = components
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("Missing ticket: {}", uri))?;
+                let (ticket, _ext) = ticket_and_ext
+                    .split_once('.')
+                    .ok_or_else(|| anyhow::anyhow!("Missing ext: {}", ticket_and_ext))?;
                 let ticket = iroh::ticket::BlobTicket::from_str(ticket)?;
                 let (node, hash, format) = ticket.into_parts();
                 if format != BlobFormat::Raw {
@@ -66,21 +92,17 @@ impl<'a> HashOrTicket<'a> {
                 let namespace = components
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("Missing namespace: {}", uri))?;
-                let key = components
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Missing key: {}", uri))?;
+                let key = components.join("/");
                 let namespace = iroh::sync::NamespaceId::from_str(namespace)?;
-                Self::Doc(namespace, iroh::base32::parse_vec(key)?)
+                Self::Doc(uri, NamespaceIdOrDocTicket::NamespaceId(namespace), key)
             }
             Some("docticket") => {
                 let ticket = components
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("Missing ticket: {}", uri))?;
-                let key = components
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Missing key: {}", uri))?;
+                let key = components.join("/");
                 let ticket = DocTicket::from_str(ticket)?;
-                Self::DocTicket(ticket, iroh::base32::parse_vec(key)?)
+                Self::Doc(uri, NamespaceIdOrDocTicket::DocTicket(ticket), key)
             }
             other => {
                 return Err(anyhow::anyhow!("{:?}", other));
@@ -88,123 +110,6 @@ impl<'a> HashOrTicket<'a> {
         })
     }
 }
-
-async fn finish_download(
-    mut stream: impl Stream<Item = anyhow::Result<DownloadProgress>> + std::marker::Unpin,
-) -> anyhow::Result<()> {
-    while let Some(item) = stream.next().await {
-        match item? {
-            DownloadProgress::AllDone => break,
-            DownloadProgress::Abort(error) => {
-                return Err(error.into());
-            }
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-async fn wait_until_available(
-    doc: &Doc,
-    key: &[u8],
-    iroh: &Iroh,
-    mut looking_for_hash: Option<Hash>,
-) -> anyhow::Result<bytes::Bytes> {
-    let mut events = doc.subscribe().await?;
-
-    while let Some(event) = events.next().await {
-        match event? {
-            // If a new insert was made with the key then just use that.
-            LiveEvent::InsertLocal { entry }
-            | LiveEvent::InsertRemote {
-                entry,
-                content_status: ContentStatus::Complete,
-                from: _,
-            } => {
-                if entry.key() == key {
-                    return iroh.blobs.read_to_bytes(entry.content_hash()).await;
-                }
-            }
-            // If a new insert was made and we don't have the content available then at least we know what hash
-            // we're looking for.
-            LiveEvent::InsertRemote {
-                entry,
-                content_status: ContentStatus::Incomplete | ContentStatus::Missing,
-                from: _,
-            } => {
-                if entry.key() == key {
-                    looking_for_hash = Some(entry.content_hash());
-                }
-            }
-            LiveEvent::ContentReady { hash } => {
-                if looking_for_hash == Some(hash) {
-                    return iroh.blobs.read_to_bytes(hash).await;
-                }
-            }
-            LiveEvent::NeighborUp(_) | LiveEvent::NeighborDown(_) | LiveEvent::SyncFinished(_) => {}
-        }
-    }
-
-    Err(anyhow::anyhow!("Event stream ran out."))
-}
-
-async fn get_entry_in_doc(doc: &Doc, key: &[u8]) -> anyhow::Result<Entry> {
-    if let Some(entry) = doc
-        .get_one(Query::single_latest_per_key().key_exact(key))
-        .await?
-    {
-        Ok(entry)
-    } else {
-        let mut events = doc.subscribe().await?;
-
-        while let Some(event) = events.next().await {
-            match event? {
-                LiveEvent::InsertLocal { entry } | LiveEvent::InsertRemote { entry, .. } => {
-                    if entry.key() == key {
-                        return Ok(entry);
-                    }
-                }
-                LiveEvent::ContentReady { .. }
-                | LiveEvent::NeighborUp(_)
-                | LiveEvent::NeighborDown(_)
-                | LiveEvent::SyncFinished(_) => {}
-            }
-        }
-
-        Err(anyhow::anyhow!("Event stream ran out."))
-    }
-}
-
-async fn get_key_in_doc(doc: &Doc, iroh: &Iroh, key: &[u8]) -> anyhow::Result<bytes::Bytes> {
-    if let Some(entry) = doc
-        .get_one(Query::single_latest_per_key().key_exact(key))
-        .await?
-    {
-        // If the content is available then we can just return it immediately
-        if let Ok(bytes) = entry.content_bytes(iroh).await {
-            Ok(bytes)
-        } else {
-            // Otherwise we need to wait until it becomes availble, but at least
-            // we know the hash we're waiting for.
-            wait_until_available(doc, key, iroh, Some(entry.content_hash())).await
-        }
-    } else {
-        // We don't know the hash we're waiting for, so just wait for an insert to be made to the key.
-        wait_until_available(doc, key, iroh, None).await
-    }
-}
-
-async fn print_keys(doc: &Doc) -> anyhow::Result<()> {
-    let mut stream = doc.get_many(Query::all()).await?;
-
-    while let Some(entry) = stream.next().await {
-        dbg!(&entry);
-    }
-
-    Ok(())
-}
-
 async fn handle_url(url: &str, iroh: &Iroh) -> anyhow::Result<bytes::Bytes> {
     match HashOrTicket::parse(url)? {
         HashOrTicket::Hash(hash, _ext) => iroh.blobs.read_to_bytes(hash).await,
@@ -228,18 +133,9 @@ async fn handle_url(url: &str, iroh: &Iroh) -> anyhow::Result<bytes::Bytes> {
 
             iroh.blobs.read_to_bytes(hash).await
         }
-        HashOrTicket::Doc(namespace, key) => {
-            let doc = iroh
-                .docs
-                .open(namespace)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Missing document: {}", namespace))?;
-
-            get_key_in_doc(&doc, iroh, &key).await
-        }
-        HashOrTicket::DocTicket(ticket, key) => {
-            let doc = iroh.docs.import(ticket).await?;
-            get_key_in_doc(&doc, iroh, &key).await
+        HashOrTicket::Doc(_, namespace_or_ticket, key) => {
+            let doc = namespace_or_ticket.get_doc(iroh).await?;
+            get_key_in_doc(&doc, iroh, &string_key_to_bytes_key(&key)).await
         }
     }
 }
@@ -273,28 +169,46 @@ extern "C" fn create_identifier(
     let anchor = anchor.as_str();
     let path = cpp::StringRef::from_ptr(path);
 
-    match (
-        HashOrTicket::parse(path.as_str()),
-        HashOrTicket::parse(anchor),
-    ) {
-        // If the path is just a hash but the anchor is a ticket, construct a new ticket using
-        // the peer from the anchor ticket.
-        (Ok(HashOrTicket::Hash(hash, ext)), Ok(HashOrTicket::Ticket(node, ..))) => {
-            let ticket = BlobTicket::new(node, hash, iroh::rpc_protocol::BlobFormat::Raw)
-                .expect("Failed to create ticket");
+    let try_create_identifier = || {
+        match (
+            HashOrTicket::parse(path.as_str()),
+            HashOrTicket::parse(anchor),
+        ) {
+            // If the path is just a hash but the anchor is a ticket, construct a new ticket using
+            // the peer from the anchor ticket.
+            (Ok(HashOrTicket::Hash(hash, ext)), Ok(HashOrTicket::Ticket(node, ..))) => {
+                let ticket = BlobTicket::new(node, hash, iroh::rpc_protocol::BlobFormat::Raw)?;
 
-            let new_url = format!("iroh://ticket/{}.{}", ticket, ext);
-            let new_url = std::ffi::CString::new(new_url).expect("Failed to construct iroh URI");
-            let new_url = cpp::String::new(&new_url);
+                let new_url = format!("iroh://ticket/{}.{}", ticket, ext);
+                let new_url = std::ffi::CString::new(new_url)?;
+                let new_url = cpp::String::new(&new_url);
 
-            unsafe {
-                *output = new_url.ptr() as _;
+                unsafe {
+                    *output = new_url.ptr() as _;
+                }
             }
+            (Err(_), Ok(HashOrTicket::Doc(url, ..))) => {
+                let url = url.join(path.as_str())?;
+
+                let new_url = url.to_string();
+                let new_url = std::ffi::CString::new(new_url)?;
+                let new_url = cpp::String::new(&new_url);
+
+                unsafe {
+                    *output = new_url.ptr() as _;
+                }
+            }
+            _ => unsafe {
+                *output = path.ptr() as *mut ffi::std_String_t;
+            },
         }
-        _ => unsafe {
-            *output = path.ptr() as *mut ffi::std_String_t;
-        },
+
+        Ok::<_, anyhow::Error>(())
     };
+
+    if let Err(error) = try_create_identifier() {
+        println!("{}", error);
+    }
 }
 
 extern "C" fn get_modification_timestamp(
@@ -306,36 +220,31 @@ extern "C" fn get_modification_timestamp(
 
     let iroh = &IROH;
 
-    RUNTIME
-        .block_on(async {
-            let (doc, key) = match HashOrTicket::parse(path.as_str()) {
-                // If the path doesn't point to a document, just set the timestamp to 0.
-                Ok(HashOrTicket::Hash(..) | HashOrTicket::Ticket(..)) | Err(_) => {
-                    unsafe {
-                        *timestamp = ar::Timestamp::from_time(0.0).ptr() as _;
-                    };
-                    return Ok(());
-                }
-                // Otherwise try to load a document and get the timestamp of the entry matching the key.
-                Ok(HashOrTicket::Doc(namespace, key)) => (
-                    iroh.docs
-                        .open(namespace)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("Missing document: {}", namespace))?,
-                    key,
-                ),
-                Ok(HashOrTicket::DocTicket(ticket, key)) => (iroh.docs.import(ticket).await?, key),
-            };
+    let result = RUNTIME.block_on(async {
+        match HashOrTicket::parse(path.as_str()) {
+            // If the path doesn't point to a document, just set the timestamp to 0.
+            Ok(HashOrTicket::Hash(..) | HashOrTicket::Ticket(..)) | Err(_) => {
+                unsafe {
+                    *timestamp = ar::Timestamp::from_time(0.0).ptr() as _;
+                };
+                return Ok(());
+            }
+            // Otherwise try to load a document and get the timestamp of the entry matching the key.
+            Ok(HashOrTicket::Doc(_, namespace_or_ticket, key)) => {
+                let doc = namespace_or_ticket.get_doc(iroh).await?;
+                let entry = get_entry_in_doc(&doc, &string_key_to_bytes_key(&key)).await?;
+                unsafe {
+                    *timestamp = ar::Timestamp::from_time(entry.timestamp() as f64).ptr() as _;
+                };
+            }
+        };
 
-            let entry = get_entry_in_doc(&doc, &key).await?;
+        Ok::<_, anyhow::Error>(())
+    });
 
-            unsafe {
-                *timestamp = ar::Timestamp::from_time(entry.timestamp() as f64).ptr() as _;
-            };
-
-            Ok::<_, anyhow::Error>(())
-        })
-        .unwrap();
+    if let Err(error) = result {
+        println!("{}", error);
+    }
 }
 
 #[ctor]

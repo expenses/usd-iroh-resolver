@@ -4714,8 +4714,10 @@ dependencies = [
  "ctor",
  "futures-util",
  "iroh",
+ "itertools",
  "lazy_static",
  "tokio",
+ "url",
 ]
 
 [[package]]

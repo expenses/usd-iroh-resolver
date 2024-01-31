@@ -2,8 +2,8 @@ use bbl_usd::{ar, cpp, ffi, tf};
 use ctor::ctor;
 use itertools::Itertools;
 use lazy_static::lazy_static;
-use std::str::FromStr;
 use std::ffi::c_void;
+use std::str::FromStr;
 
 use iroh::{
     client::quic::{Doc, Iroh},
@@ -38,14 +38,14 @@ enum NamespaceIdOrDocTicket {
 }
 
 impl NamespaceIdOrDocTicket {
-    async fn get_doc(self, iroh: &Iroh) -> anyhow::Result<Doc> {
+    async fn get_doc(&self, iroh: &Iroh) -> anyhow::Result<Doc> {
         match self {
             Self::NamespaceId(namespace) => iroh
                 .docs
-                .open(namespace)
+                .open(*namespace)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Missing document: {}", namespace)),
-            Self::DocTicket(ticket) => iroh.docs.import(ticket).await,
+            Self::DocTicket(ticket) => iroh.docs.import(ticket.clone()).await,
         }
     }
 }
@@ -85,7 +85,7 @@ impl HashOrTicket {
                 let ticket = iroh::ticket::BlobTicket::from_str(ticket)?;
                 let (node, hash, format) = ticket.into_parts();
                 if format != BlobFormat::Raw {
-                    return Err(anyhow::anyhow!("{:?}", format));
+                    return Err(anyhow::anyhow!("Invalid format: {:?}", format));
                 }
                 Self::Ticket(node, hash)
             }
@@ -102,11 +102,12 @@ impl HashOrTicket {
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("Missing ticket: {}", uri))?;
                 let key = components.join("/");
-                let ticket = DocTicket::from_str(ticket)?;
+                let ticket = DocTicket::from_str(ticket)
+                    .map_err(|err| anyhow::anyhow!("Failed ot parse {}: {}", uri, err))?;
                 Self::Doc(uri, NamespaceIdOrDocTicket::DocTicket(ticket), key)
             }
             other => {
-                return Err(anyhow::anyhow!("{:?}", other));
+                return Err(anyhow::anyhow!("Invalid domain: {:?}", other));
             }
         })
     }
@@ -135,8 +136,12 @@ async fn handle_url(url: &str, iroh: &Iroh) -> anyhow::Result<bytes::Bytes> {
             iroh.blobs.read_to_bytes(hash).await
         }
         HashOrTicket::Doc(_, namespace_or_ticket, key) => {
-            let doc = namespace_or_ticket.get_doc(iroh).await?;
-            get_key_in_doc(&doc, iroh, &string_key_to_bytes_key(&key)).await
+            let doc = namespace_or_ticket.get_doc(iroh).await.map_err(|err| {
+                err.context(format!("Failed to get doc {:?}", &namespace_or_ticket))
+            })?;
+            get_key_in_doc(&doc, iroh, &string_key_to_bytes_key(&key))
+                .await
+                .map_err(|err| err.context(format!("Failed to get key: {:?}", key)))
         }
     }
 }
@@ -151,7 +156,7 @@ extern "C" fn open_asset(
             ffi::ar_asset_from_bytes(bytes.as_ptr() as _, bytes.len(), output);
         },
         Err(error) => {
-            println!("{}", error);
+            println!("{:#}", error);
         }
     }
 }
@@ -183,23 +188,23 @@ extern "C" fn create_identifier(
                 let ticket = BlobTicket::new(node, hash, iroh::rpc_protocol::BlobFormat::Raw)?;
 
                 let new_url = format!("iroh://ticket/{}.{}", ticket, ext);
-                let new_url = std::ffi::CString::new(new_url)?;
                 let new_url = cpp::String::new(&new_url);
 
                 unsafe {
                     *output = new_url.ptr() as _;
                 }
+                std::mem::forget(new_url);
             }
             (Err(_), Ok(HashOrTicket::Doc(url, ..))) => {
                 let url = url.join(path.as_str())?;
 
                 let new_url = url.to_string();
-                let new_url = std::ffi::CString::new(new_url)?;
                 let new_url = cpp::String::new(&new_url);
 
                 unsafe {
                     *output = new_url.ptr() as _;
                 }
+                std::mem::forget(new_url);
             }
             _ => unsafe {
                 *output = path.ptr() as *mut ffi::std_String_t;
@@ -254,23 +259,25 @@ extern "C" fn get_modification_timestamp(
 
 struct WritableAsset {
     path: String,
-    bytes: Vec<u8>
+    bytes: Vec<u8>,
 }
 
-extern "C" fn open_writable_asset(path: *const ffi::ar_ResolvedPath_t, mode: ffi::ar_ResolvedWriteMode) -> *mut c_void {
+extern "C" fn open_writable_asset(
+    path: *const ffi::ar_ResolvedPath_t,
+    mode: ffi::ar_ResolvedWriteMode,
+) -> *mut c_void {
     assert_eq!(mode, ffi::ar_ResolvedWriteMode_ar_ResolvedWriteMode_Replace);
     Box::into_raw(Box::new(WritableAsset {
-        path: ar::ResolvedPathRef::from_raw(path).get_path_string().as_str().to_owned(),
-        bytes: Vec::new()
+        path: ar::ResolvedPathRef::from_raw(path)
+            .get_path_string()
+            .as_str()
+            .to_owned(),
+        bytes: Vec::new(),
     })) as _
 }
 
-extern "C" fn close_writable_asset(
-    context: *mut c_void
-) -> bool {
-    let asset = unsafe {
-        &*(context as *mut WritableAsset)
-    };
+extern "C" fn close_writable_asset(context: *mut c_void) -> bool {
+    let asset = unsafe { &*(context as *mut WritableAsset) };
 
     let try_fn = |iroh| async move {
         let author_id = std::env::var("IROH_AUTHOR_ID")?;
@@ -280,11 +287,20 @@ extern "C" fn close_writable_asset(
             Ok(HashOrTicket::Doc(_, namespace_or_ticket, key)) => {
                 let doc = namespace_or_ticket.get_doc(iroh).await?;
                 let key = string_key_to_bytes_key(&key);
-                doc.set_bytes(author_id, bytes::Bytes::copy_from_slice(&key), &*asset.bytes)
-                    .await?;
+                doc.set_bytes(
+                    author_id,
+                    bytes::Bytes::copy_from_slice(&key),
+                    &*asset.bytes,
+                )
+                .await?;
                 Ok(())
             }
-            other => return Err(anyhow::anyhow!("{:?}", other)),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "close_writable_asset parsing error: {:?}",
+                    other
+                ))
+            }
         }
     };
 
@@ -296,20 +312,21 @@ extern "C" fn close_writable_asset(
     }
 }
 
-extern "C" fn write_writable_asset(context: *mut c_void, src: *const c_void, count: usize, offset: usize) -> usize {
-    let asset = unsafe {
-        &mut *(context as *mut WritableAsset)
-    };
+extern "C" fn write_writable_asset(
+    context: *mut c_void,
+    src: *const c_void,
+    count: usize,
+    offset: usize,
+) -> usize {
+    let asset = unsafe { &mut *(context as *mut WritableAsset) };
 
-    let src = unsafe {
-        std::slice::from_raw_parts(src as *const u8, count)
-    };
+    let src = unsafe { std::slice::from_raw_parts(src as *const u8, count) };
 
     if count + offset > asset.bytes.len() {
         asset.bytes.resize(count + offset, 0);
     }
 
-    asset.bytes[offset..offset+count].copy_from_slice(src);
+    asset.bytes[offset..offset + count].copy_from_slice(src);
 
     count
 }
@@ -318,15 +335,15 @@ extern "C" fn write_writable_asset(context: *mut c_void, src: *const c_void, cou
 fn ctor() {
     let ty = tf::Type::declare("IrohResolver");
     ty.set_factory(
-        create_identifier,
-        create_identifier,
-        open_asset,
-        resolve,
-        resolve,
+        Some(create_identifier),
+        Some(create_identifier),
+        Some(open_asset),
+        Some(resolve),
+        Some(resolve),
         None,
         Some(get_modification_timestamp),
-        close_writable_asset,
-        open_writable_asset,
-        write_writable_asset
+        Some(close_writable_asset),
+        Some(open_writable_asset),
+        Some(write_writable_asset),
     );
 }

@@ -45,7 +45,13 @@ impl NamespaceIdOrDocTicket {
                 .open(*namespace)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Missing document: {}", namespace)),
-            Self::DocTicket(ticket) => iroh.docs.import(ticket.clone()).await,
+            Self::DocTicket(ticket) => {
+                if let Some(doc) = iroh.docs.open(ticket.capability.id()).await? {
+                    return Ok(doc);
+                }
+
+                iroh.docs.import(ticket.clone()).await
+            },
         }
     }
 }

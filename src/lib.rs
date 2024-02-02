@@ -157,12 +157,22 @@ extern "C" fn open_asset(
     output: *mut *mut ffi::ar_AssetSharedPtr_t,
 ) {
     let string = ar::ResolvedPathRef::from_raw(path).get_path_string();
-    match RUNTIME.block_on(handle_url(string.as_str(), &IROH)) {
-        Ok(bytes) => unsafe {
+    let future = |iroh| async move {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handle_url(string.as_str(), iroh),
+        )
+        .await
+    };
+    match RUNTIME.block_on(future(&IROH)) {
+        Ok(Ok(bytes)) => unsafe {
             ffi::ar_asset_from_bytes(bytes.as_ptr() as _, bytes.len(), output);
         },
-        Err(error) => {
+        Ok(Err(error)) => {
             println!("{:#}", error);
+        }
+        Err(timedout) => {
+            println!("Timed out: {}", timedout);
         }
     }
 }
